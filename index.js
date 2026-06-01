@@ -90,13 +90,8 @@ const CONFIG = {
 const GROUP_REPLY_FOOTER = `
 
 ━━━━━━━━━━━━━━━━━━━━━━
-🖼️ *Go here to see the scan images:*
-https://view.stradus.com/
-
 🤖 *Copy-paste the clinical profile here to get suggestions regarding MRI protocols:*
 https://ai.studio/apps/86a65a19-cf2f-46de-b4d0-9a941be83604
-
-🔗 https://mri-protocols.vercel.app/
 
 📚 *MRI protocol books*
 https://notebooklm.google.com/notebook/467e8684-c512-488f-b1f7-3a450e344cd5`;
@@ -450,18 +445,43 @@ const bot = new Telegraf(CONFIG.TELEGRAM_TOKEN);
 
 bot.command('start', async (ctx) => {
   await trackAndForward(ctx);
-  await ctx.reply(`🏥 *Medical Clinical Profile Bot Ready*
+  await ctx.reply(`Step 1: Upload Your Clinical Context
 
-*Supported Files:*
-📷 Images, 📄 PDFs, 🎤 Voice, 🎵 Audio, 🎬 Videos
+Simply send your patient documents directly to the bot. You can upload multiple
+items one after the other:
 
-*Manual Processing Commands:*
-• *.* - Standard Clinical Profile (Smart 3 FPS)
-• *..* - Secondary Modality Chained Analysis (Profile + Advice)
-• *.1 / ..1* - Smart 1 FPS Extraction
-• *.2 / ..2* - Smart 2 FPS Extraction
-• *clear* - Clear buffered documents
-• *status* - View pending items in queue`, { parse_mode: 'Markdown' });
+  - Images: Photos of clinical sheets, handwritten notes, or prior scan results.
+  - PDFs: Typed lab reports, pathology findings, or prior imaging reports.
+  - Audio/Voice Notes: Voice dictations explaining the clinical background.
+  - Videos: Video recordings of CT/MRI scan scroll-throughs.
+  - Text: Typed notes containing clinical history or indications.
+
+The bot will acknowledge each item and add it to your temporary queue.
+
+ Step 2: Trigger the Analysis
+
+Once your files are uploaded, send one of the following short commands as a text
+message to initiate processing:
+
+  - Send a single dot (.)
+    Generates a Standard Clinical Profile (Step 1) along with the Quick
+    Reference Metadata card. (Extracts video frames at a default of 3 frames per
+    second).
+
+  - Send a double dot (..)
+    Generates a Chained Secondary Analysis. The bot first generates the clinical
+    profile, then automatically passes that profile to a secondary
+    expert-radiologist persona to provide modality protocol advice and list
+    potential findings.
+
+  - Adjust Video Frame Rates (.1, .2, .3 or ..1, ..2, ..3)
+    If your queue contains video files, you can modify the frame extraction
+    density. For example, sending .1 extracts 1 frame per second (better for
+    slow-scrolling videos), while .3 extracts 3 frames per second (best for
+    fast-scrolling videos).
+
+ 
+ `, { parse_mode: 'Markdown' });
 });
 
 bot.command('clear', async (ctx) => {
