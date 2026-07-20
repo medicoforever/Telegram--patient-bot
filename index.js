@@ -9,6 +9,14 @@ import fs from 'fs';
 import os from 'os';
 import { join } from 'path';
 
+// --- Lecture Converter imports (Mode 2) ---
+import PDFDocument from 'pdfkit';
+import {
+  Document as DocxDocument, Packer, Paragraph, TextRun,
+  HeadingLevel, AlignmentType,
+  Table as DocxTable, TableRow, TableCell, WidthType, ShadingType
+} from 'docx';
+
 // Setup FFmpeg path automatically
 ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 
@@ -84,7 +92,7 @@ const CONFIG = {
   TELEGRAM_TOKEN: process.env.TELEGRAM_BOT_TOKEN,
   ADMIN_ID: process.env.ADMIN_ID, // Restricts /users command & receives forwarded messages
   MEDIA_TIMEOUT_MS: 300000, // 5 minutes
-  COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', 'clear', 'status', 'users']
+  COMMANDS: ['.', '.1', '.2', '.3', '..', '..1', '..2', '..3', 'help', 'clear', 'status', 'users', '#']
 };
 
 const GROUP_REPLY_FOOTER = `
@@ -97,11 +105,72 @@ https://ai.studio/apps/86a65a19-cf2f-46de-b4d0-9a941be83604
 https://notebooklm.google.com/notebook/467e8684-c512-488f-b1f7-3a450e344cd5`;
 
 // ======================================================================
+// 🎓 LECTURE CONVERTER CONFIGURATION (Mode 2)
+// ======================================================================
+const LECTURE_MODEL_CHAIN = [
+  'gemini-3.5-flash',
+  'gemini-3-flash-preview',
+  'gemini-2.5-flash',
+];
+
+const LECTURE_TRANSCRIPTION_PROMPT = `You are an expert medical transcriptionist and educator. Listen to this medical lecture audio carefully and create comprehensive, well-structured educational notes.
+
+IMPORTANT INSTRUCTIONS:
+1. Transcribe and organize ALL content from the lecture - do not skip anything
+2. Structure the content into clear sections with headings and subheadings
+3. Use bullet points for key concepts
+4. Highlight important medical terms, conditions, and treatments
+5. Include any clinical pearls, mnemonics, or exam tips mentioned
+6. Preserve the educational flow and logical organization
+7. If tables or comparisons are mentioned, format them clearly
+8. Include all numerical values, dosages, and statistics mentioned
+
+OUTPUT FORMAT - Return a JSON array of sections:
+[
+    {
+        "type": "title",
+        "content": "Lecture Title"
+    },
+    {
+        "type": "heading",
+        "content": "Section Heading"
+    },
+    {
+        "type": "subheading", 
+        "content": "Subsection Heading"
+    },
+    {
+        "type": "text",
+        "content": "Regular paragraph text"
+    },
+    {
+        "type": "bullet_list",
+        "content": ["Point 1", "Point 2", "Point 3"]
+    },
+    {
+        "type": "key_point",
+        "content": "Important clinical pearl or key takeaway"
+    },
+    {
+        "type": "table",
+        "headers": ["Column1", "Column2"],
+        "rows": [["data1", "data2"], ["data3", "data4"]]
+    },
+    {
+        "type": "mnemonic",
+        "content": "Mnemonic or memory aid"
+    }
+]
+
+Make the notes comprehensive enough that a medical student could study from them without needing the original lecture. Ensure medical accuracy and completeness.`;
+
+// ======================================================================
 // 📊 DATA STORAGE, TIMEOUTS, USER TRACKING (In-Memory Only)
 // ======================================================================
 const chatMediaBuffers = new Map();
 const chatTimeouts = new Map();
 const registeredUsers = new Map(); // tracks users who messaged the bot since startup
+const lectureModeSessions = new Map(); // tracks which users have lecture mode (#) active
 
 // Automatically registers user data and forwards messages to the admin
 async function trackAndForward(ctx) {
@@ -170,6 +239,12 @@ async function getTelegramFileAsBase64(ctx, fileId) {
   const fileLink = await ctx.telegram.getFileLink(fileId);
   const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
   return Buffer.from(response.data).toString('base64');
+}
+
+async function getTelegramFileAsBuffer(ctx, fileId) {
+  const fileLink = await ctx.telegram.getFileLink(fileId);
+  const response = await axios.get(fileLink.href, { responseType: 'arraybuffer' });
+  return Buffer.from(response.data);
 }
 
 async function extractFramesFromVideo(videoBuffer, targetFps = 3) {
@@ -273,7 +348,7 @@ async function sendSafeMessage(ctx, text) {
 }
 
 // ======================================================================
-// 🧠 GEMINI API FAILOVER LOOP (Locked to fast model config)
+// 🧠 GEMINI API FAILOVER LOOP (Mode 1 — Locked to fast model config)
 // ======================================================================
 async function generateGeminiContent(requestContent, systemInstruction) {
   const keys = CONFIG.API_KEYS;
@@ -318,7 +393,434 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 }
 
 // ======================================================================
-// 🚀 PIPELINE PROCESSOR
+// 🎓 LECTURE CONVERTER — GEMINI MODEL FALLBACK (Mode 2)
+// ======================================================================
+async function generateLectureContent(base64Audio, mimeType, prompt) {
+  const keys = CONFIG.API_KEYS;
+  if (keys.length === 0) {
+    throw new Error('No API keys configured! Check GEMINI_API_KEYS variable.');
+  }
+
+  let lastError = null;
+
+  for (const modelName of LECTURE_MODEL_CHAIN) {
+    for (let i = 0; i < keys.length; i++) {
+      try {
+        console.log(`[Lecture] Trying model: ${modelName}, key #${i + 1}`);
+
+        const genAI = new GoogleGenerativeAI(keys[i]);
+        const model = genAI.getGenerativeModel({
+          model: modelName,
+          generationConfig: {
+            temperature: 0.1,
+            maxOutputTokens: 65000,
+          },
+        });
+
+        const result = await model.generateContent([
+          prompt,
+          { inlineData: { data: base64Audio, mimeType: mimeType } },
+        ]);
+
+        const responseText = result.response.text();
+        if (!responseText) {
+          throw new Error('Received empty response from API');
+        }
+
+        console.log(`[Lecture] ✅ Success with ${modelName}, key #${i + 1}`);
+        return { text: responseText, model: modelName };
+
+      } catch (error) {
+        lastError = error;
+        console.error(`[Lecture] ❌ ${modelName} key #${i + 1} failed: ${error.message}`);
+      }
+    }
+    console.warn(`[Lecture] All keys exhausted for ${modelName}, trying next model...`);
+  }
+
+  throw new Error(`All models and keys failed. Last error: ${lastError?.message || 'Unknown error'}`);
+}
+
+// ======================================================================
+// 🎓 LECTURE CONVERTER — JSON PARSER
+// ======================================================================
+function extractLectureJson(text) {
+  // Try to find JSON in code blocks first
+  const codeBlockMatch = text.match(/```(?:json)?\s*\n?(.*?)\n?```/s);
+  let jsonStr = codeBlockMatch ? codeBlockMatch[1].trim() : text.trim();
+
+  try {
+    return JSON.parse(jsonStr);
+  } catch (e) {
+    // Try to find array pattern
+    const arrayMatch = jsonStr.match(/\[[\s\S]*\]/);
+    if (arrayMatch) {
+      return JSON.parse(arrayMatch[0]);
+    }
+    throw new Error(`Failed to parse lecture JSON: ${e.message}`);
+  }
+}
+
+// ======================================================================
+// 🎓 LECTURE CONVERTER — PDF GENERATOR (PDFKit)
+// ======================================================================
+function createLecturePdf(sections, outputPath) {
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({
+      size: 'LETTER',
+      margins: { top: 72, bottom: 72, left: 72, right: 72 },
+    });
+
+    const stream = fs.createWriteStream(outputPath);
+    doc.pipe(stream);
+
+    for (const section of sections) {
+      const type = section.type || 'text';
+      const content = section.content || '';
+
+      switch (type) {
+        case 'title':
+          doc.fontSize(24).font('Helvetica-Bold').fillColor('#1a237e')
+            .text(String(content), { align: 'center' });
+          doc.moveDown(1.5);
+          break;
+
+        case 'heading':
+          doc.moveDown(0.8);
+          doc.fontSize(18).font('Helvetica-Bold').fillColor('#283593')
+            .text(String(content));
+          doc.moveDown(0.5);
+          break;
+
+        case 'subheading':
+          doc.moveDown(0.5);
+          doc.fontSize(14).font('Helvetica-Bold').fillColor('#3949ab')
+            .text(String(content));
+          doc.moveDown(0.3);
+          break;
+
+        case 'text':
+          doc.fontSize(11).font('Helvetica').fillColor('#000000')
+            .text(String(content), { align: 'justify', lineGap: 4 });
+          doc.moveDown(0.3);
+          break;
+
+        case 'bullet_list': {
+          const items = Array.isArray(content) ? content : [content];
+          for (const item of items) {
+            doc.fontSize(11).font('Helvetica').fillColor('#000000')
+              .text(`\u2022  ${item}`, { indent: 20, lineGap: 2 });
+          }
+          doc.moveDown(0.2);
+          break;
+        }
+
+        case 'key_point':
+          doc.moveDown(0.3);
+          doc.fontSize(11).font('Helvetica-Bold').fillColor('#b71c1c')
+            .text(`KEY POINT: ${content}`, { indent: 20 });
+          doc.moveDown(0.3);
+          break;
+
+        case 'mnemonic':
+          doc.moveDown(0.3);
+          doc.fontSize(11).font('Helvetica-BoldOblique').fillColor('#1b5e20')
+            .text(`MNEMONIC: ${content}`, { indent: 20 });
+          doc.moveDown(0.3);
+          break;
+
+        case 'table': {
+          const headers = section.headers || [];
+          const rows = section.rows || [];
+          if (headers.length > 0 && rows.length > 0) {
+            doc.moveDown(0.5);
+            // Header row
+            doc.fontSize(11).font('Helvetica-Bold').fillColor('#283593');
+            doc.text(headers.join('  |  '), { indent: 10 });
+            doc.moveDown(0.1);
+            // Separator
+            doc.fontSize(10).font('Helvetica').fillColor('#9fa8da');
+            doc.text('─'.repeat(60), { indent: 10 });
+            // Data rows
+            doc.fontSize(10).font('Helvetica').fillColor('#000000');
+            for (const row of rows) {
+              doc.text(row.map(c => String(c)).join('  |  '), { indent: 10 });
+            }
+            doc.moveDown(0.5);
+          }
+          break;
+        }
+
+        default:
+          if (content) {
+            doc.fontSize(11).font('Helvetica').fillColor('#000000')
+              .text(String(content));
+            doc.moveDown(0.2);
+          }
+          break;
+      }
+    }
+
+    doc.end();
+    stream.on('finish', resolve);
+    stream.on('error', reject);
+  });
+}
+
+// ======================================================================
+// 🎓 LECTURE CONVERTER — DOCX GENERATOR
+// ======================================================================
+async function createLectureDocx(sections, outputPath) {
+  const children = [];
+
+  for (const section of sections) {
+    const type = section.type || 'text';
+    const content = section.content || '';
+
+    switch (type) {
+      case 'title':
+        children.push(new Paragraph({
+          children: [new TextRun({
+            text: String(content), bold: true, size: 48,
+            color: '1a237e', font: 'Calibri',
+          })],
+          heading: HeadingLevel.TITLE,
+          alignment: AlignmentType.CENTER,
+          spacing: { after: 400 },
+        }));
+        break;
+
+      case 'heading':
+        children.push(new Paragraph({
+          children: [new TextRun({
+            text: String(content), bold: true, size: 36,
+            color: '283593', font: 'Calibri',
+          })],
+          heading: HeadingLevel.HEADING_1,
+          spacing: { before: 300, after: 200 },
+        }));
+        break;
+
+      case 'subheading':
+        children.push(new Paragraph({
+          children: [new TextRun({
+            text: String(content), bold: true, size: 28,
+            color: '3949ab', font: 'Calibri',
+          })],
+          heading: HeadingLevel.HEADING_2,
+          spacing: { before: 200, after: 100 },
+        }));
+        break;
+
+      case 'text':
+        children.push(new Paragraph({
+          children: [new TextRun({
+            text: String(content), size: 22, font: 'Calibri',
+          })],
+          spacing: { after: 100 },
+        }));
+        break;
+
+      case 'bullet_list': {
+        const items = Array.isArray(content) ? content : [content];
+        for (const item of items) {
+          children.push(new Paragraph({
+            children: [new TextRun({
+              text: String(item), size: 22, font: 'Calibri',
+            })],
+            bullet: { level: 0 },
+            spacing: { after: 50 },
+          }));
+        }
+        break;
+      }
+
+      case 'key_point':
+        children.push(new Paragraph({
+          children: [new TextRun({
+            text: `KEY POINT: ${content}`, bold: true, size: 22,
+            color: 'b71c1c', font: 'Calibri',
+          })],
+          spacing: { before: 100, after: 100 },
+          indent: { left: 400 },
+        }));
+        break;
+
+      case 'mnemonic':
+        children.push(new Paragraph({
+          children: [new TextRun({
+            text: `MNEMONIC: ${content}`, bold: true, italics: true,
+            size: 22, color: '1b5e20', font: 'Calibri',
+          })],
+          spacing: { before: 100, after: 100 },
+          indent: { left: 400 },
+        }));
+        break;
+
+      case 'table': {
+        const headers = section.headers || [];
+        const rows = section.rows || [];
+        if (headers.length > 0 && rows.length > 0) {
+          const tableRows = [];
+          // Header row
+          tableRows.push(new TableRow({
+            children: headers.map(h => new TableCell({
+              children: [new Paragraph({
+                children: [new TextRun({
+                  text: String(h), bold: true, size: 22,
+                  color: 'ffffff', font: 'Calibri',
+                })],
+              })],
+              shading: { fill: '283593', type: ShadingType.SOLID, color: 'auto' },
+            })),
+          }));
+          // Data rows
+          for (let ri = 0; ri < rows.length; ri++) {
+            const row = rows[ri];
+            tableRows.push(new TableRow({
+              children: row.map(cell => new TableCell({
+                children: [new Paragraph({
+                  children: [new TextRun({
+                    text: String(cell), size: 20, font: 'Calibri',
+                  })],
+                })],
+                shading: ri % 2 === 0
+                  ? { fill: 'e8eaf6', type: ShadingType.SOLID, color: 'auto' }
+                  : { fill: 'f5f5f5', type: ShadingType.SOLID, color: 'auto' },
+              })),
+            }));
+          }
+          children.push(new DocxTable({
+            rows: tableRows,
+            width: { size: 100, type: WidthType.PERCENTAGE },
+          }));
+          children.push(new Paragraph({ spacing: { after: 200 } }));
+        }
+        break;
+      }
+
+      default:
+        if (content) {
+          children.push(new Paragraph({
+            children: [new TextRun({
+              text: String(content), size: 22, font: 'Calibri',
+            })],
+            spacing: { after: 80 },
+          }));
+        }
+        break;
+    }
+  }
+
+  const doc = new DocxDocument({
+    sections: [{
+      properties: {
+        page: {
+          margin: {
+            top: 1440, right: 1440, bottom: 1440, left: 1440,
+          },
+        },
+      },
+      children,
+    }],
+  });
+
+  const buffer = await Packer.toBuffer(doc);
+  fs.writeFileSync(outputPath, buffer);
+  console.log(`[Lecture] DOCX created at ${outputPath}`);
+}
+
+// ======================================================================
+// 🎓 LECTURE CONVERTER — MAIN PIPELINE
+// ======================================================================
+async function processLectureAudio(ctx, fileId, mimeType, filename) {
+  const chatId = ctx.chat.id;
+
+  const statusMsg = await ctx.reply(
+    '🔄 *Processing your audio file...*\n\n' +
+    '⏳ This may take several minutes depending on the lecture length.\n' +
+    'Please wait while I transcribe and generate your notes.',
+    { parse_mode: 'Markdown' }
+  );
+
+  try {
+    // Step 1: Download audio from Telegram
+    console.log(`[Lecture] Downloading: ${filename}`);
+    const base64Audio = await getTelegramFileAsBase64(ctx, fileId);
+    console.log(`[Lecture] Downloaded ${(base64Audio.length * 0.75 / 1024 / 1024).toFixed(1)} MB`);
+
+    // Step 2: Transcribe with model fallback
+    const { text: responseText, model: modelUsed } = await generateLectureContent(
+      base64Audio, mimeType, LECTURE_TRANSCRIPTION_PROMPT
+    );
+    console.log(`[Lecture] Transcription done with ${modelUsed}`);
+
+    // Step 3: Parse structured JSON response
+    const sections = extractLectureJson(responseText);
+
+    // Step 4: Extract lecture title
+    let lectureTitle = 'Medical Lecture Notes';
+    for (const section of sections) {
+      if (section.type === 'title' && section.content) {
+        lectureTitle = String(section.content);
+        break;
+      }
+    }
+
+    // Step 5: Create safe filename
+    const safeTitle = lectureTitle
+      .replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_')
+      .substring(0, 50) || 'lecture_notes';
+
+    // Step 6: Generate PDF
+    const pdfPath = join(os.tmpdir(), `lec_${Date.now()}_${safeTitle}.pdf`);
+    await createLecturePdf(sections, pdfPath);
+
+    // Step 7: Generate DOCX
+    const docxPath = join(os.tmpdir(), `lec_${Date.now()}_${safeTitle}.docx`);
+    await createLectureDocx(sections, docxPath);
+
+    // Step 8: Delete status message
+    try { await ctx.telegram.deleteMessage(chatId, statusMsg.message_id); } catch (e) {}
+
+    // Step 9: Send PDF to user
+    await ctx.replyWithDocument(
+      { source: pdfPath, filename: `${safeTitle}.pdf` },
+      { caption: `📄 *PDF Notes* — ${lectureTitle}\n\n_Generated using ${modelUsed}_`, parse_mode: 'Markdown' }
+    );
+
+    // Step 10: Send DOCX to user
+    await ctx.replyWithDocument(
+      { source: docxPath, filename: `${safeTitle}.docx` },
+      { caption: `📝 *DOCX Notes* — ${lectureTitle}\n\n_Generated using ${modelUsed}_`, parse_mode: 'Markdown' }
+    );
+
+    // Step 11: Completion message
+    await ctx.reply(
+      `✅ *Conversion complete!*\n\n` +
+      `📚 Title: _${lectureTitle}_\n` +
+      `🤖 Model: \`${modelUsed}\`\n\n` +
+      `Both PDF and DOCX sent above.\n` +
+      `Send another audio, or *#* to switch back.`,
+      { parse_mode: 'Markdown' }
+    );
+
+    // Clean up temp files
+    try { fs.unlinkSync(pdfPath); } catch (e) {}
+    try { fs.unlinkSync(docxPath); } catch (e) {}
+
+  } catch (error) {
+    console.error('[Lecture] Pipeline error:', error);
+    try { await ctx.telegram.deleteMessage(chatId, statusMsg.message_id); } catch (e) {}
+    await ctx.reply(
+      `❌ *Error processing audio:*\n\n\`${error.message}\`\n\nPlease try again with a different file.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+}
+
+// ======================================================================
+// 🚀 PIPELINE PROCESSOR (Mode 1 — existing)
 // ======================================================================
 async function processMedia(ctx, chatId, mediaFiles, targetFps = 3, isSecondaryMode = false) {
   try {
@@ -480,7 +982,13 @@ message to initiate processing:
     slow-scrolling videos), while .3 extracts 3 frames per second (best for
     fast-scrolling videos).
 
- 
+━━━━━━━━━━━━━━━━━━━━━━
+🎓 *Lecture Converter Mode*
+━━━━━━━━━━━━━━━━━━━━━━
+Send *#* to activate Lecture Converter mode.
+In this mode, send an audio file of a medical lecture and receive
+structured notes as both *PDF* and *DOCX* files.
+Send *#* again to deactivate and return to normal mode.
  `, { parse_mode: 'Markdown' });
 });
 
@@ -494,6 +1002,7 @@ bot.command('clear', async (ctx) => {
 bot.command('status', async (ctx) => {
   await trackAndForward(ctx);
   const chatId = ctx.chat.id;
+  const userId = String(ctx.from.id);
   const buffer = getChatBuffer(chatId);
   const counts = { images: 0, pdfs: 0, audio: 0, video: 0, texts: 0 };
 
@@ -505,6 +1014,8 @@ bot.command('status', async (ctx) => {
     else if (b.type === 'text') counts.texts++;
   });
 
+  const lectureActive = lectureModeSessions.get(userId) ? '✅ Active' : '❌ Inactive';
+
   const text = `📊 *Buffer Status:*
 📷 Images: ${counts.images}
 📄 PDFs: ${counts.pdfs}
@@ -512,7 +1023,8 @@ bot.command('status', async (ctx) => {
 🎬 Videos: ${counts.video}
 📝 Text Notes: ${counts.texts}
 ━━━━━━━━━━
-📦 Total buffered: ${buffer.length} / 20 items max`;
+📦 Total buffered: ${buffer.length} / 20 items max
+🎓 Lecture Mode: ${lectureActive}`;
   await ctx.reply(text, { parse_mode: 'Markdown' });
 });
 
@@ -569,42 +1081,132 @@ const registerMediaItem = async (ctx, type, fileId, mimeType, captionText) => {
   }
 };
 
-bot.on(message('photo'), ctx => {
+// --- PHOTO HANDLER (with lecture mode check) ---
+bot.on(message('photo'), async (ctx) => {
+  const userId = String(ctx.from.id);
+  if (lectureModeSessions.get(userId)) {
+    await ctx.reply('📸 *Lecture Converter mode is active.* Images are not processed in this mode.\n\nPlease send an audio file or voice message.\nSend *#* to switch back.', { parse_mode: 'Markdown' });
+    return;
+  }
   const photo = ctx.message.photo;
   const fileId = photo[photo.length - 1].file_id;
   registerMediaItem(ctx, 'image', fileId, 'image/jpeg', ctx.message.caption);
 });
 
-bot.on(message('document'), ctx => {
+// --- DOCUMENT HANDLER (with lecture mode check for audio documents) ---
+bot.on(message('document'), async (ctx) => {
+  const userId = String(ctx.from.id);
   const doc = ctx.message.document;
+
+  if (lectureModeSessions.get(userId)) {
+    // In lecture mode, check if document is audio
+    const mime = (doc.mime_type || '').toLowerCase();
+    const fname = (doc.file_name || '').toLowerCase();
+    const audioExtensions = ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.wma', '.opus', '.webm', '.mp4', '.mpeg', '.mpga'];
+    const isAudio = mime.startsWith('audio/') || mime === 'video/mp4' || mime === 'video/webm'
+      || audioExtensions.some(ext => fname.endsWith(ext));
+
+    if (isAudio) {
+      await trackAndForward(ctx);
+      await processLectureAudio(ctx, doc.file_id, doc.mime_type || 'audio/mpeg', doc.file_name || 'audio');
+      return;
+    }
+
+    await ctx.reply('📎 *Lecture Converter mode is active.* Only audio files are accepted.\n\n📎 Supported: MP3, WAV, OGG, FLAC, AAC, M4A, WMA, OPUS, WEBM, MP4\n\nSend *#* to switch back.', { parse_mode: 'Markdown' });
+    return;
+  }
+
+  // Normal mode — only PDFs
   if (!doc.mime_type || !doc.mime_type.includes('pdf')) {
     return ctx.reply("⚠️ Only PDF documents are supported!");
   }
   registerMediaItem(ctx, 'pdf', doc.file_id, 'application/pdf', ctx.message.caption);
 });
 
-bot.on(message('video'), ctx => {
+// --- VIDEO HANDLER (with lecture mode check) ---
+bot.on(message('video'), async (ctx) => {
+  const userId = String(ctx.from.id);
+  if (lectureModeSessions.get(userId)) {
+    await ctx.reply('🎬 *Lecture Converter mode is active.* Videos are not processed in this mode.\n\nPlease send an audio file or voice message.\nSend *#* to switch back.', { parse_mode: 'Markdown' });
+    return;
+  }
   const vid = ctx.message.video;
   registerMediaItem(ctx, 'video', vid.file_id, vid.mime_type || 'video/mp4', ctx.message.caption);
 });
 
-bot.on(message('voice'), ctx => {
+// --- VOICE HANDLER (with lecture mode check) ---
+bot.on(message('voice'), async (ctx) => {
+  const userId = String(ctx.from.id);
+  if (lectureModeSessions.get(userId)) {
+    await trackAndForward(ctx);
+    const voice = ctx.message.voice;
+    await processLectureAudio(ctx, voice.file_id, voice.mime_type || 'audio/ogg', 'voice_message.ogg');
+    return;
+  }
+  // Normal mode: buffer
   const voice = ctx.message.voice;
   registerMediaItem(ctx, 'voice', voice.file_id, voice.mime_type || 'audio/ogg', ctx.message.caption);
 });
 
-bot.on(message('audio'), ctx => {
+// --- AUDIO HANDLER (with lecture mode check) ---
+bot.on(message('audio'), async (ctx) => {
+  const userId = String(ctx.from.id);
+  if (lectureModeSessions.get(userId)) {
+    await trackAndForward(ctx);
+    const audio = ctx.message.audio;
+    await processLectureAudio(ctx, audio.file_id, audio.mime_type || 'audio/mpeg', audio.file_name || 'audio.mp3');
+    return;
+  }
+  // Normal mode: buffer
   const audio = ctx.message.audio;
   registerMediaItem(ctx, 'audio', audio.file_id, audio.mime_type || 'audio/mpeg', ctx.message.caption);
 });
 
+// --- TEXT HANDLER (with # mode switching) ---
 bot.on(message('text'), async (ctx) => {
   await trackAndForward(ctx);
   const text = ctx.message.text.trim();
   const chatId = ctx.chat.id;
+  const userId = String(ctx.from.id);
 
-  const isPrimaryTrigger = /^(\.|(\.[1-3]))$/.test(text);
-  const isSecondaryTrigger = /^(\.\.|(\.\.[1-3]))$/.test(text);
+  // ─── # command: Toggle Lecture Converter Mode ───
+  if (text === '#') {
+    const isActive = lectureModeSessions.get(userId);
+    if (isActive) {
+      lectureModeSessions.delete(userId);
+      await ctx.reply(
+        '✅ *Lecture Converter deactivated.* Back to normal mode.\n\n' +
+        'Upload files and use *.* or *..* to process.',
+        { parse_mode: 'Markdown' }
+      );
+    } else {
+      lectureModeSessions.set(userId, true);
+      await ctx.reply(
+        '✅ *Lecture Converter activated!*\n\n' +
+        'Send me an audio file or voice message of a medical lecture.\n' +
+        'I will convert it to structured *PDF* & *DOCX* notes.\n\n' +
+        '📎 Supported: MP3, WAV, OGG, FLAC, AAC, M4A, WMA, OPUS, WEBM, MP4\n\n' +
+        'Send *#* again to deactivate.',
+        { parse_mode: 'Markdown' }
+      );
+    }
+    return;
+  }
+
+  // ─── If lecture mode is active, reject non-audio text ───
+  if (lectureModeSessions.get(userId)) {
+    await ctx.reply(
+      '🎤 *Lecture Converter mode is active.*\n\n' +
+      'Please send an audio file or voice message.\n' +
+      'Send *#* to deactivate.',
+      { parse_mode: 'Markdown' }
+    );
+    return;
+  }
+
+  // ─── Normal Mode: Existing . / .. trigger logic ───
+  const isPrimaryTrigger = /^(\.|(\\.[1-3]))$/.test(text);
+  const isSecondaryTrigger = /^(\\.\\.|(\\.\\.[1-3]))$/.test(text);
 
   if (isPrimaryTrigger || isSecondaryTrigger) {
     const mediaFiles = clearChatBuffer(chatId);
@@ -673,7 +1275,7 @@ if (RENDER_URL) {
   console.log('⚠️ RENDER_EXTERNAL_URL is undefined. Internal self-ping is offline (Local environment).');
 }
 
-bot.launch(() => console.log('🚀 Telegram Bot Engine Active (MongoDB and replies disabled)'));
+bot.launch(() => console.log('🚀 Telegram Bot Engine Active'));
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
