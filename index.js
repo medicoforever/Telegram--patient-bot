@@ -395,7 +395,7 @@ async function generateGeminiContent(requestContent, systemInstruction) {
 // ======================================================================
 // 🎓 LECTURE CONVERTER — GEMINI MODEL FALLBACK (Mode 2)
 // ======================================================================
-async function generateLectureContent(base64Audio, mimeType, prompt) {
+async function generateLectureContent(requestContent) {
   const keys = CONFIG.API_KEYS;
   if (keys.length === 0) {
     throw new Error('No API keys configured! Check GEMINI_API_KEYS variable.');
@@ -417,10 +417,7 @@ async function generateLectureContent(base64Audio, mimeType, prompt) {
           },
         });
 
-        const result = await model.generateContent([
-          prompt,
-          { inlineData: { data: base64Audio, mimeType: mimeType } },
-        ]);
+        const result = await model.generateContent(requestContent);
 
         const responseText = result.response.text();
         if (!responseText) {
@@ -733,32 +730,47 @@ async function createLectureDocx(sections, outputPath) {
 // ======================================================================
 // 🎓 LECTURE CONVERTER — MAIN PIPELINE
 // ======================================================================
-async function processLectureAudio(ctx, fileId, mimeType, filename) {
-  const chatId = ctx.chat.id;
-
+async function processLectureBuffer(ctx, chatId, mediaFiles) {
   const statusMsg = await ctx.reply(
-    '🔄 *Processing your audio file...*\n\n' +
-    '⏳ This may take several minutes depending on the lecture length.\n' +
+    '🔄 *Processing your files for Lecture Notes...*\n\n' +
+    '⏳ This may take several minutes.\n' +
     'Please wait while I transcribe and generate your notes.',
     { parse_mode: 'Markdown' }
   );
 
   try {
-    // Step 1: Download audio from Telegram
-    console.log(`[Lecture] Downloading: ${filename}`);
-    const base64Audio = await getTelegramFileAsBase64(ctx, fileId);
-    console.log(`[Lecture] Downloaded ${(base64Audio.length * 0.75 / 1024 / 1024).toFixed(1)} MB`);
+    const textContents = [];
+    const binaryMedia = [];
+    let fileCount = 0;
 
-    // Step 2: Transcribe with model fallback
-    const { text: responseText, model: modelUsed } = await generateLectureContent(
-      base64Audio, mimeType, LECTURE_TRANSCRIPTION_PROMPT
-    );
+    for (const m of mediaFiles) {
+      if (m.type === 'text') {
+        textContents.push(`[Text note]: ${m.content}`);
+      } else {
+        binaryMedia.push(m);
+        fileCount++;
+      }
+    }
+
+    const contentParts = binaryMedia.map(m => ({
+      inlineData: { data: m.data, mimeType: m.mimeType }
+    }));
+
+    let promptText = LECTURE_TRANSCRIPTION_PROMPT;
+    if (textContents.length > 0) {
+      promptText += `\n\n=== ADDITIONAL CONTEXT/NOTES ===\n${textContents.join('\n\n')}\n=== END CONTEXT ===`;
+    }
+
+    const requestContent = contentParts.length > 0 ? [promptText, ...contentParts] : [promptText];
+
+    // Transcribe with model fallback
+    const { text: responseText, model: modelUsed } = await generateLectureContent(requestContent);
     console.log(`[Lecture] Transcription done with ${modelUsed}`);
 
-    // Step 3: Parse structured JSON response
+    // Parse structured JSON response
     const sections = extractLectureJson(responseText);
 
-    // Step 4: Extract lecture title
+    // Extract lecture title
     let lectureTitle = 'Medical Lecture Notes';
     for (const section of sections) {
       if (section.type === 'title' && section.content) {
@@ -767,41 +779,41 @@ async function processLectureAudio(ctx, fileId, mimeType, filename) {
       }
     }
 
-    // Step 5: Create safe filename
+    // Create safe filename
     const safeTitle = lectureTitle
       .replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '_')
       .substring(0, 50) || 'lecture_notes';
 
-    // Step 6: Generate PDF
+    // Generate PDF
     const pdfPath = join(os.tmpdir(), `lec_${Date.now()}_${safeTitle}.pdf`);
     await createLecturePdf(sections, pdfPath);
 
-    // Step 7: Generate DOCX
+    // Generate DOCX
     const docxPath = join(os.tmpdir(), `lec_${Date.now()}_${safeTitle}.docx`);
     await createLectureDocx(sections, docxPath);
 
-    // Step 8: Delete status message
+    // Delete status message
     try { await ctx.telegram.deleteMessage(chatId, statusMsg.message_id); } catch (e) {}
 
-    // Step 9: Send PDF to user
+    // Send PDF to user
     await ctx.replyWithDocument(
       { source: pdfPath, filename: `${safeTitle}.pdf` },
       { caption: `📄 *PDF Notes* — ${lectureTitle}\n\n_Generated using ${modelUsed}_`, parse_mode: 'Markdown' }
     );
 
-    // Step 10: Send DOCX to user
+    // Send DOCX to user
     await ctx.replyWithDocument(
       { source: docxPath, filename: `${safeTitle}.docx` },
       { caption: `📝 *DOCX Notes* — ${lectureTitle}\n\n_Generated using ${modelUsed}_`, parse_mode: 'Markdown' }
     );
 
-    // Step 11: Completion message
+    // Completion message
     await ctx.reply(
       `✅ *Conversion complete!*\n\n` +
       `📚 Title: _${lectureTitle}_\n` +
       `🤖 Model: \`${modelUsed}\`\n\n` +
       `Both PDF and DOCX sent above.\n` +
-      `Send another audio, or *#* to switch back.`,
+      `Send more files, or *#* to switch back to Clinical Profile mode.`,
       { parse_mode: 'Markdown' }
     );
 
@@ -813,7 +825,7 @@ async function processLectureAudio(ctx, fileId, mimeType, filename) {
     console.error('[Lecture] Pipeline error:', error);
     try { await ctx.telegram.deleteMessage(chatId, statusMsg.message_id); } catch (e) {}
     await ctx.reply(
-      `❌ *Error processing audio:*\n\n\`${error.message}\`\n\nPlease try again with a different file.`,
+      `❌ *Error processing files:*\n\n\`${error.message}\`\n\nPlease try again with different files.`,
       { parse_mode: 'Markdown' }
     );
   }
@@ -1081,83 +1093,48 @@ const registerMediaItem = async (ctx, type, fileId, mimeType, captionText) => {
   }
 };
 
-// --- PHOTO HANDLER (with lecture mode check) ---
+// --- PHOTO HANDLER ---
 bot.on(message('photo'), async (ctx) => {
-  const userId = String(ctx.from.id);
-  if (lectureModeSessions.get(userId)) {
-    await ctx.reply('📸 *Lecture Converter mode is active.* Images are not processed in this mode.\n\nPlease send an audio file or voice message.\nSend *#* to switch back.', { parse_mode: 'Markdown' });
-    return;
-  }
   const photo = ctx.message.photo;
   const fileId = photo[photo.length - 1].file_id;
   registerMediaItem(ctx, 'image', fileId, 'image/jpeg', ctx.message.caption);
 });
 
-// --- DOCUMENT HANDLER (with lecture mode check for audio documents) ---
+// --- DOCUMENT HANDLER ---
 bot.on(message('document'), async (ctx) => {
-  const userId = String(ctx.from.id);
   const doc = ctx.message.document;
-
-  if (lectureModeSessions.get(userId)) {
-    // In lecture mode, check if document is audio
-    const mime = (doc.mime_type || '').toLowerCase();
-    const fname = (doc.file_name || '').toLowerCase();
-    const audioExtensions = ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.wma', '.opus', '.webm', '.mp4', '.mpeg', '.mpga'];
-    const isAudio = mime.startsWith('audio/') || mime === 'video/mp4' || mime === 'video/webm'
-      || audioExtensions.some(ext => fname.endsWith(ext));
-
-    if (isAudio) {
-      await trackAndForward(ctx);
-      await processLectureAudio(ctx, doc.file_id, doc.mime_type || 'audio/mpeg', doc.file_name || 'audio');
-      return;
-    }
-
-    await ctx.reply('📎 *Lecture Converter mode is active.* Only audio files are accepted.\n\n📎 Supported: MP3, WAV, OGG, FLAC, AAC, M4A, WMA, OPUS, WEBM, MP4\n\nSend *#* to switch back.', { parse_mode: 'Markdown' });
+  
+  const mime = (doc.mime_type || '').toLowerCase();
+  const fname = (doc.file_name || '').toLowerCase();
+  const audioExtensions = ['.mp3', '.wav', '.ogg', '.flac', '.aac', '.m4a', '.wma', '.opus', '.webm', '.mp4', '.mpeg', '.mpga'];
+  const isAudio = mime.startsWith('audio/') || mime === 'video/mp4' || mime === 'video/webm' || audioExtensions.some(ext => fname.endsWith(ext));
+  
+  if (isAudio) {
+    registerMediaItem(ctx, 'audio', doc.file_id, doc.mime_type || 'audio/mpeg', ctx.message.caption);
     return;
   }
-
-  // Normal mode — only PDFs
+  
   if (!doc.mime_type || !doc.mime_type.includes('pdf')) {
-    return ctx.reply("⚠️ Only PDF documents are supported!");
+    return ctx.reply("⚠️ Only PDF and Audio documents are supported!");
   }
+  
   registerMediaItem(ctx, 'pdf', doc.file_id, 'application/pdf', ctx.message.caption);
 });
 
-// --- VIDEO HANDLER (with lecture mode check) ---
+// --- VIDEO HANDLER ---
 bot.on(message('video'), async (ctx) => {
-  const userId = String(ctx.from.id);
-  if (lectureModeSessions.get(userId)) {
-    await ctx.reply('🎬 *Lecture Converter mode is active.* Videos are not processed in this mode.\n\nPlease send an audio file or voice message.\nSend *#* to switch back.', { parse_mode: 'Markdown' });
-    return;
-  }
   const vid = ctx.message.video;
   registerMediaItem(ctx, 'video', vid.file_id, vid.mime_type || 'video/mp4', ctx.message.caption);
 });
 
-// --- VOICE HANDLER (with lecture mode check) ---
+// --- VOICE HANDLER ---
 bot.on(message('voice'), async (ctx) => {
-  const userId = String(ctx.from.id);
-  if (lectureModeSessions.get(userId)) {
-    await trackAndForward(ctx);
-    const voice = ctx.message.voice;
-    await processLectureAudio(ctx, voice.file_id, voice.mime_type || 'audio/ogg', 'voice_message.ogg');
-    return;
-  }
-  // Normal mode: buffer
   const voice = ctx.message.voice;
   registerMediaItem(ctx, 'voice', voice.file_id, voice.mime_type || 'audio/ogg', ctx.message.caption);
 });
 
-// --- AUDIO HANDLER (with lecture mode check) ---
+// --- AUDIO HANDLER ---
 bot.on(message('audio'), async (ctx) => {
-  const userId = String(ctx.from.id);
-  if (lectureModeSessions.get(userId)) {
-    await trackAndForward(ctx);
-    const audio = ctx.message.audio;
-    await processLectureAudio(ctx, audio.file_id, audio.mime_type || 'audio/mpeg', audio.file_name || 'audio.mp3');
-    return;
-  }
-  // Normal mode: buffer
   const audio = ctx.message.audio;
   registerMediaItem(ctx, 'audio', audio.file_id, audio.mime_type || 'audio/mpeg', ctx.message.caption);
 });
@@ -1183,9 +1160,8 @@ bot.on(message('text'), async (ctx) => {
       lectureModeSessions.set(userId, true);
       await ctx.reply(
         '✅ *Lecture Converter activated!*\n\n' +
-        'Send me an audio file or voice message of a medical lecture.\n' +
-        'I will convert it to structured *PDF* & *DOCX* notes.\n\n' +
-        '📎 Supported: MP3, WAV, OGG, FLAC, AAC, M4A, WMA, OPUS, WEBM, MP4\n\n' +
+        'Upload files (audio, voice, documents) to the buffer.\n' +
+        'When you are ready, send *.* to convert them to *PDF* & *DOCX* notes.\n\n' +
         'Send *#* again to deactivate.',
         { parse_mode: 'Markdown' }
       );
@@ -1193,25 +1169,20 @@ bot.on(message('text'), async (ctx) => {
     return;
   }
 
-  // ─── If lecture mode is active, reject non-audio text ───
-  if (lectureModeSessions.get(userId)) {
-    await ctx.reply(
-      '🎤 *Lecture Converter mode is active.*\n\n' +
-      'Please send an audio file or voice message.\n' +
-      'Send *#* to deactivate.',
-      { parse_mode: 'Markdown' }
-    );
-    return;
-  }
-
   // ─── Normal Mode: Existing . / .. trigger logic ───
-  const isPrimaryTrigger = /^(\.|(\\.[1-3]))$/.test(text);
-  const isSecondaryTrigger = /^(\\.\\.|(\\.\\.[1-3]))$/.test(text);
+  const isPrimaryTrigger = /^(\.|(\.[1-3]))$/.test(text);
+  const isSecondaryTrigger = /^(\.\.|(\.\.[1-3]))$/.test(text);
 
   if (isPrimaryTrigger || isSecondaryTrigger) {
     const mediaFiles = clearChatBuffer(chatId);
     if (mediaFiles.length === 0) {
       await ctx.reply("ℹ️ Buffer empty. Please upload some files or type some context first!");
+      return;
+    }
+
+    // ─── LECTURE MODE PROCESSING ───
+    if (lectureModeSessions.get(userId)) {
+      await processLectureBuffer(ctx, chatId, mediaFiles);
       return;
     }
 
@@ -1233,6 +1204,7 @@ bot.on(message('text'), async (ctx) => {
       await ctx.reply(`❌ Processing Failed: ${err.message}`);
     }
     return;
+
   }
 
   // Handle clinical text input added to buffer
